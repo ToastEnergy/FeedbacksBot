@@ -35,7 +35,7 @@ function parseAnswer(text: string): "yes" | "no" | null {
     .normalize("NFD")
     .replace(/[̀-ͯ]/g, "") // "Sì" -> "si"
     .replace(/[^\p{L}]+/gu, ""); // drop punctuation, spaces, emoji: "SI!" -> "si"
-  if (word === "si") return "yes";
+  if (word === "si" || word === "yes") return "yes";
   if (word === "no") return "no";
   return null;
 }

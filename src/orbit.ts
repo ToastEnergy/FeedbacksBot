@@ -1,75 +1,55 @@
 import { config } from "./config";
 
 /**
- * Orbit client over its MCP endpoint (POST /mcp, JSON-RPC), authenticated with the orb_ token.
- * (Newer Orbit releases also have a REST API at /api/public/v1, but this instance doesn't yet.)
+ * Orbit client over its public REST API (/api/public/v1), authenticated with an orb_ token.
+ * Docs: https://github.com/coollabsio/orbit/blob/main/docs/public-api.md
  */
 
 interface Project { id: string; key: string; name: string }
 interface Status { id: string; name: string; category: string }
-export interface Task { id: string; identifier?: string; url?: string; title: string }
+interface Me { workspace: { id: string; name: string } }
+export interface Task { id: string; identifier: string; url: string; title: string }
 
-let rpcId = 0;
-let sessionId: string | null = null;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function rpc<T>(method: string, params?: unknown): Promise<T> {
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${config.orbitToken}`,
-    "Content-Type": "application/json",
-    Accept: "application/json, text/event-stream",
-    "MCP-Protocol-Version": "2025-06-18",
-  };
-  if (sessionId) headers["Mcp-Session-Id"] = sessionId;
-
-  const res = await fetch(`${config.orbitUrl}/mcp`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method, params }),
-  });
-  const sid = res.headers.get("Mcp-Session-Id");
-  if (sid) sessionId = sid;
-  const text = await res.text();
-  if (!res.ok) throw new Error(`[orbit] ${method} -> ${res.status}: ${text}`);
-
-  // The server may answer as plain JSON or as a single SSE "data:" frame.
-  const json = text.trimStart().startsWith("{")
-    ? JSON.parse(text)
-    : JSON.parse(text.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5)).join("\n"));
-  if (json.error) throw new Error(`[orbit] ${method}: ${json.error.message ?? JSON.stringify(json.error)}`);
-  return json.result as T;
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(`${config.orbitUrl}/api/public/v1${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${config.orbitToken}`,
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (res.status === 429 && attempt < 5) {
+      const wait = Number(res.headers.get("Retry-After")) || 5;
+      console.warn(`[orbit] rate limited, retrying in ${wait}s`);
+      await sleep(wait * 1000);
+      continue;
+    }
+    if (!res.ok) {
+      // Errors are RFC 9457 problem documents: { code, detail, errors?, ... }
+      const text = await res.text();
+      let detail = text;
+      try {
+        const p = JSON.parse(text);
+        detail = [p.code, p.detail, p.errors && JSON.stringify(p.errors)].filter(Boolean).join(": ");
+      } catch {}
+      throw new Error(`[orbit] ${method} ${path} -> ${res.status} ${detail}`);
+    }
+    return (await res.json()) as T;
+  }
 }
 
-async function callTool<T>(name: string, args: Record<string, unknown>): Promise<T> {
-  const result = await rpc<{ isError?: boolean; structuredContent?: T; content?: { text?: string }[] }>(
-    "tools/call",
-    { name, arguments: args },
-  );
-  const text = result.content?.map((c) => c.text ?? "").join("\n") ?? "";
-  if (result.isError) throw new Error(`[orbit] ${name}: ${text}`);
-  return (result.structuredContent ?? JSON.parse(text)) as T;
-}
+let target: { workspaceId: string; projectId: string; statusId: string } | null = null;
 
-let target: { projectId: string; statusId: string } | null = null;
-
-/** Finds the project and the "Feedback" status (column) once, at startup. */
+/** Finds the workspace, project and the "Feedback" status (column) once, at startup. */
 export async function initOrbit(): Promise<void> {
-  await rpc("initialize", {
-    protocolVersion: "2025-06-18",
-    capabilities: {},
-    clientInfo: { name: "sgc-feedback-bot", version: "1.0.0" },
-  });
-  await fetch(`${config.orbitUrl}/mcp`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${config.orbitToken}`,
-      "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-      ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
-    },
-    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
-  });
+  const { workspace } = await request<Me>("GET", "/me");
+  const ws = `/workspaces/${workspace.id}`;
 
-  const { items: projects } = await callTool<{ items: Project[] }>("list_projects", {});
+  const { items: projects } = await request<{ items: Project[] }>("GET", `${ws}/projects`);
   const key = config.orbitProjectKey.toLowerCase();
   const project = key ? projects.find((p) => p.key.toLowerCase() === key) : projects[0];
   if (!project) {
@@ -78,10 +58,10 @@ export async function initOrbit(): Promise<void> {
     );
   }
 
-  const { items: statuses } = await callTool<{ items: Status[] }>("list_task_statuses", {
-    project_id: project.id,
-    limit: 100,
-  });
+  const { items: statuses } = await request<{ items: Status[] }>(
+    "GET",
+    `${ws}/projects/${project.id}/statuses?limit=100`,
+  );
   const wanted = config.orbitStatusName.toLowerCase();
   const status = statuses.find((s) => s.name.toLowerCase() === wanted);
   if (!status) {
@@ -90,13 +70,13 @@ export async function initOrbit(): Promise<void> {
     );
   }
 
-  target = { projectId: project.id, statusId: status.id };
-  console.log(`[orbit] feedback goes to ${project.key} / ${status.name}`);
+  target = { workspaceId: workspace.id, projectId: project.id, statusId: status.id };
+  console.log(`[orbit] feedback goes to ${workspace.name} / ${project.key} / ${status.name}`);
 }
 
 export async function createFeedbackTask(title: string, description: string): Promise<Task> {
   if (!target) throw new Error("[orbit] initOrbit() not called");
-  return callTool<Task>("create_task", {
+  return request<Task>("POST", `/workspaces/${target.workspaceId}/tasks`, {
     project_id: target.projectId,
     status_id: target.statusId,
     title,
